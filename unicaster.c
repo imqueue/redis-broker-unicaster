@@ -47,6 +47,10 @@ static char redis_bind_ips[MAX_REDIS_BINDS][INET_ADDRSTRLEN];
 static int redis_bind_count = 0;
 static int allow_all_interfaces = 0;
 
+static pthread_t *thread_ids = NULL;
+static int thread_count = 0;
+static pthread_mutex_t thread_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 void generate_redis_guid() {
     uuid_t binuuid;
     uuid_generate(binuuid);
@@ -190,17 +194,27 @@ static size_t WriteMemoryCallback(const void *contents, const size_t size, const
 
 char **fetch_pod_ips(int *pod_count) {
     struct MemoryStruct chunk;
-    static char *pod_ips[MAX_PODS];
+    char **pod_ips = calloc(MAX_PODS, sizeof(char*));  // Use calloc to initialize to NULL
     *pod_count = 0;
+
+    if (!pod_ips) {
+        return NULL;
+    }
 
     chunk.memory = malloc(1);
     chunk.size = 0;
+
+    if (!chunk.memory) {
+        free(pod_ips);
+
+        return NULL;
+    }
 
     CURL* curl = curl_easy_init();
 
     if (!curl) {
         free(chunk.memory);
-
+        free(pod_ips);
         return NULL;
     }
 
@@ -264,6 +278,15 @@ char **fetch_pod_ips(int *pod_count) {
         }
     }
 
+    if (res != CURLE_OK) {
+        for (int i = 0; i < *pod_count; i++) {
+            free(pod_ips[i]);
+        }
+        free(pod_ips);
+        pod_ips = NULL;
+        *pod_count = 0;
+    }
+
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
     free(chunk.memory);
@@ -272,6 +295,10 @@ char **fetch_pod_ips(int *pod_count) {
 }
 
 void send_unicast_message(const char *ip, const int port, const char *message) {
+    if (!ip || !message) {
+        return;
+    }
+
     const int sock = socket(AF_INET, SOCK_DGRAM, 0);
 
     if (sock < 0) {
@@ -280,9 +307,14 @@ void send_unicast_message(const char *ip, const int port, const char *message) {
 
     struct sockaddr_in dest = {0};
     dest.sin_family = AF_INET;
-    dest.sin_addr.s_addr = inet_addr(ip);
-    dest.sin_port = htons(port);
 
+    if (inet_pton(AF_INET, ip, &dest.sin_addr) != 1) {
+        close(sock);
+
+        return;
+    }
+
+    dest.sin_port = htons(port);
     sendto(sock, message, strlen(message), 0, (struct sockaddr *)&dest, sizeof(dest));
     close(sock);
 }
@@ -336,25 +368,6 @@ void *unicast_thread(void *arg) {
     return NULL;
 }
 
-void shutdown_callback(
-    // ReSharper disable once CppParameterMayBeConstPtrOrRef
-    RedisModuleCtx *ctx,
-    // ReSharper disable once CppParameterMayBeConst
-    RedisModuleEvent e,
-    // ReSharper disable once CppParameterMayBeConst
-    uint64_t subevent,
-    // ReSharper disable once CppParameterMayBeConstPtrOrRef
-    void *data
-) {
-    (void)ctx;
-    (void)e;
-    (void)subevent;
-    (void)data;
-
-    is_closing = 1;
-    sleep(1);
-}
-
 int count_usable_interfaces() {
     struct ifaddrs *ifaddr;
     int count = 0;
@@ -381,24 +394,22 @@ void send_udp_message(const int redis_port) {
     const int max_threads = count_usable_interfaces();
 
     if (!max_threads) {
-        RedisModule_Log(
-            NULL,
-            "notice",
-            "%s: no network interfaces found",
-            get_service_name()
-        );
+        RedisModule_Log(NULL, "notice", "%s: no network interfaces found", get_service_name());
+        return;
     }
 
-    if (getifaddrs(&ifaddr) == -1) {
-        freeifaddrs(ifaddr);
-        RedisModule_Log(
-            NULL,
-            "error",
-            "%s: getifaddrs failed in shutdown: %s",
-            get_service_name(),
-            strerror(errno)
-        );
+    // Allocate thread ID array
+    thread_ids = malloc(sizeof(pthread_t) * max_threads);
+    if (!thread_ids) {
+        RedisModule_Log(NULL, "error", "%s: failed to allocate thread array", get_service_name());
+        return;
+    }
+    thread_count = 0;
 
+    if (getifaddrs(&ifaddr) == -1) {
+        free(thread_ids);
+        thread_ids = NULL;
+        RedisModule_Log(NULL, "error", "%s: getifaddrs failed: %s", get_service_name(), strerror(errno));
         return;
     }
 
@@ -409,22 +420,59 @@ void send_udp_message(const int redis_port) {
 
         const struct sockaddr_in *addr_in = (struct sockaddr_in *)ifa->ifa_addr;
         char ip[INET_ADDRSTRLEN];
-
         inet_ntop(AF_INET, &addr_in->sin_addr, ip, sizeof(ip));
 
-        // memory is freed inside the thread
-        // ReSharper disable once CppDFAMemoryLeak
         BroadcastTask *task = malloc(sizeof(BroadcastTask));
+        if (!task) continue;
 
         strncpy(task->source_ip, ip, sizeof(task->source_ip));
         task->redis_port = redis_port;
 
         pthread_t tid;
-        pthread_create(&tid, NULL, unicast_thread, task);
-        pthread_detach(tid);
+        if (pthread_create(&tid, NULL, unicast_thread, task) == 0) {
+            thread_ids[thread_count++] = tid;
+        } else {
+            free(task);
+        }
     }
 
     freeifaddrs(ifaddr);
+}
+
+void cleanup_threads() {
+    if (!thread_ids) return;
+
+    pthread_mutex_lock(&thread_mutex);
+    is_closing = 1;
+    pthread_mutex_unlock(&thread_mutex);
+
+    // Wait for all threads to finish
+    for (int i = 0; i < thread_count; i++) {
+        pthread_join(thread_ids[i], NULL);
+    }
+
+    free(thread_ids);
+    thread_ids = NULL;
+    thread_count = 0;
+}
+
+void shutdown_callback(
+    // ReSharper disable once CppParameterMayBeConstPtrOrRef
+    RedisModuleCtx *ctx,
+    // ReSharper disable once CppParameterMayBeConst
+    RedisModuleEvent e,
+    // ReSharper disable once CppParameterMayBeConst
+    uint64_t subevent,
+    // ReSharper disable once CppParameterMayBeConstPtrOrRef
+    void *data
+) {
+    (void)ctx;
+    (void)e;
+    (void)subevent;
+    (void)data;
+
+    is_closing = 1;
+    sleep(1);
 }
 
 // Redis Module initialization
@@ -432,6 +480,8 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx) {
     generate_redis_guid();
 
     if (RedisModule_Init(ctx, "unicaster", 1, REDISMODULE_APIVER_1) == REDISMODULE_ERR) {
+        cleanup_threads();
+
         return REDISMODULE_ERR;
     }
 
@@ -494,3 +544,9 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx) {
 
     return REDISMODULE_OK;
 }
+
+void RedisModule_OnUnload() {
+    cleanup_threads();
+}
+
+
