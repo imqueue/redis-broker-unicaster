@@ -304,7 +304,7 @@ void *unicast_thread(void *arg) {
                     snprintf(
                         message,
                         sizeof(message),
-                        "%s\t%s\tdown\t%s:%d\t%d",
+                        "%s\t%s\tdown\t%s:%d",
                         broadcast_name,
                         redis_guid,
                         task->source_ip,
@@ -330,6 +330,8 @@ void *unicast_thread(void *arg) {
 
         sleep(broadcast_interval);
     }
+
+    free(task);
 
     return NULL;
 }
