@@ -274,7 +274,7 @@ char **fetch_pod_ips(int *pod_count) {
 
                         pod_ips[*pod_count] = strdup(ip);
                         (*pod_count)++;
-                        }
+                    }
                 }
             }
 
