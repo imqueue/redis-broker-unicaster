@@ -215,6 +215,7 @@ char **fetch_pod_ips(int *pod_count) {
     if (!curl) {
         free(chunk.memory);
         free(pod_ips);
+
         return NULL;
     }
 
@@ -223,6 +224,7 @@ char **fetch_pod_ips(int *pod_count) {
     if (!token_file) {
         curl_easy_cleanup(curl);
         free(chunk.memory);
+        free(pod_ips);
 
         return NULL;
     }
@@ -257,20 +259,22 @@ char **fetch_pod_ips(int *pod_count) {
         json_object *parsed_json = json_tokener_parse(chunk.memory);
         json_object *items;
 
-        if (json_object_object_get_ex(parsed_json, "items", &items)) {
-            const int n_items = (int)json_object_array_length(items);
+        if (parsed_json) {
+            if (json_object_object_get_ex(parsed_json, "items", &items)) {
+                const int n_items = (int)json_object_array_length(items);
 
-            for (int i = 0; i < n_items && *pod_count < MAX_PODS; i++) {
-                const json_object *item = json_object_array_get_idx(items, i);
-                json_object *status;
-                json_object *pod_ip;
+                for (int i = 0; i < n_items && *pod_count < MAX_PODS; i++) {
+                    const json_object *item = json_object_array_get_idx(items, i);
+                    json_object *status;
+                    json_object *pod_ip;
 
-                if (json_object_object_get_ex(item, "status", &status) &&
-                    json_object_object_get_ex(status, "podIP", &pod_ip)) {
-                    const char *ip = json_object_get_string(pod_ip);
+                    if (json_object_object_get_ex(item, "status", &status) &&
+                        json_object_object_get_ex(status, "podIP", &pod_ip)) {
+                        const char *ip = json_object_get_string(pod_ip);
 
-                    pod_ips[*pod_count] = strdup(ip);
-                    (*pod_count)++;
+                        pod_ips[*pod_count] = strdup(ip);
+                        (*pod_count)++;
+                        }
                 }
             }
 
@@ -282,6 +286,7 @@ char **fetch_pod_ips(int *pod_count) {
         for (int i = 0; i < *pod_count; i++) {
             free(pod_ips[i]);
         }
+
         free(pod_ips);
         pod_ips = NULL;
         *pod_count = 0;
@@ -294,15 +299,15 @@ char **fetch_pod_ips(int *pod_count) {
     return pod_ips;
 }
 
-void send_unicast_message(const char *ip, const int port, const char *message) {
+int send_unicast_message(const char *ip, const int port, const char *message) {
     if (!ip || !message) {
-        return;
+        return 0;
     }
 
     const int sock = socket(AF_INET, SOCK_DGRAM, 0);
 
     if (sock < 0) {
-        return;
+        return 0;
     }
 
     struct sockaddr_in dest = {0};
@@ -311,55 +316,80 @@ void send_unicast_message(const char *ip, const int port, const char *message) {
     if (inet_pton(AF_INET, ip, &dest.sin_addr) != 1) {
         close(sock);
 
-        return;
+        return 0;
     }
 
     dest.sin_port = htons(port);
     sendto(sock, message, strlen(message), 0, (struct sockaddr *)&dest, sizeof(dest));
     close(sock);
+
+    return 1;
 }
 
-void *unicast_thread(void *arg) {
-    BroadcastTask *task = arg;
-    const char *broadcast_name = get_service_name();
+void* unicast_thread(void* arg) {
+    BroadcastTask* task = arg;
+    const char* broadcast_name = get_service_name();
     const int broadcast_interval = get_interval();
+    char up_message[256];
+    char down_message[256];
+
+    snprintf(
+        down_message,
+        sizeof(down_message),
+        "%s\t%s\tdown\t%s:%d",
+        broadcast_name,
+        redis_guid,
+        task->source_ip,
+        task->redis_port
+    );
+    snprintf(
+        up_message,
+        sizeof(up_message),
+        "%s\t%s\tup\t%s:%d\t%d",
+        broadcast_name,
+        redis_guid,
+        task->source_ip,
+        task->redis_port,
+        broadcast_interval
+    );
 
     while (1) {
         int pod_count;
-        char **pod_ips = fetch_pod_ips(&pod_count);
+        char** pod_ips = fetch_pod_ips(&pod_count);
 
         if (pod_ips) {
             for (int i = 0; i < pod_count; i++) {
-                char message[256];
+                const char* message = is_closing ? down_message : up_message;
 
-                if (is_closing) {
-                    snprintf(
-                        message,
-                        sizeof(message),
-                        "%s\t%s\tdown\t%s:%d",
+                if (send_unicast_message(pod_ips[i], DEFAULT_PORT, message) < 0) {
+                    RedisModule_Log(
+                        NULL,
+                        "warning",
+                        "%s: broadcast to %s failed: %s",
                         broadcast_name,
-                        redis_guid,
                         task->source_ip,
-                        task->redis_port
+                        strerror(errno)
                     );
-                } else {
-                    snprintf(
-                        message,
-                        sizeof(message),
-                        "%s\t%s\tup\t%s:%d\t%d",
+                } else if (enable_logging) {
+                    RedisModule_Log(
+                        NULL,
+                        "notice",
+                        "%s: UDP Broadcast from %s: %s",
                         broadcast_name,
-                        redis_guid,
                         task->source_ip,
-                        task->redis_port,
-                        broadcast_interval
+                        message
                     );
                 }
 
-                send_unicast_message(pod_ips[i], DEFAULT_PORT, message);
                 free(pod_ips[i]);
             }
         }
 
+        if (is_closing) {
+            break;
+        }
+
+        free(pod_ips);
         sleep(broadcast_interval);
     }
 
@@ -395,21 +425,25 @@ void send_udp_message(const int redis_port) {
 
     if (!max_threads) {
         RedisModule_Log(NULL, "notice", "%s: no network interfaces found", get_service_name());
+
         return;
     }
 
-    // Allocate thread ID array
     thread_ids = malloc(sizeof(pthread_t) * max_threads);
+
     if (!thread_ids) {
         RedisModule_Log(NULL, "error", "%s: failed to allocate thread array", get_service_name());
+
         return;
     }
+
     thread_count = 0;
 
     if (getifaddrs(&ifaddr) == -1) {
         free(thread_ids);
         thread_ids = NULL;
         RedisModule_Log(NULL, "error", "%s: getifaddrs failed: %s", get_service_name(), strerror(errno));
+
         return;
     }
 
@@ -423,12 +457,11 @@ void send_udp_message(const int redis_port) {
         inet_ntop(AF_INET, &addr_in->sin_addr, ip, sizeof(ip));
 
         BroadcastTask *task = malloc(sizeof(BroadcastTask));
-        if (!task) continue;
-
         strncpy(task->source_ip, ip, sizeof(task->source_ip));
         task->redis_port = redis_port;
 
         pthread_t tid;
+
         if (pthread_create(&tid, NULL, unicast_thread, task) == 0) {
             thread_ids[thread_count++] = tid;
         } else {
@@ -446,7 +479,6 @@ void cleanup_threads() {
     is_closing = 1;
     pthread_mutex_unlock(&thread_mutex);
 
-    // Wait for all threads to finish
     for (int i = 0; i < thread_count; i++) {
         pthread_join(thread_ids[i], NULL);
     }
@@ -548,5 +580,3 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx) {
 void RedisModule_OnUnload() {
     cleanup_threads();
 }
-
-
