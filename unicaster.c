@@ -62,7 +62,7 @@ void init_ip_patterns() {
         RedisModule_Log(
             NULL,
             "warning",
-            "SELECTED_INTERFACES is not defined"
+            "DEBUG: SELECTED_INTERFACES is not defined"
         );
 
         return;
@@ -71,7 +71,7 @@ void init_ip_patterns() {
     RedisModule_Log(
         NULL,
         "debug",
-        "SELECTED_INTERFACES: %s",
+        "DEBUG: SELECTED_INTERFACES: %s",
         patterns_env
     );
 
@@ -95,7 +95,7 @@ void init_ip_patterns() {
         RedisModule_Log(
             NULL,
             "debug",
-            "pattern found: %s",
+            "DEBUG: pattern found: %s",
             pattern
         );
 
@@ -130,7 +130,7 @@ int ip_matches_pattern(const char *ip) {
         RedisModule_Log(
             NULL,
             "debug",
-            "ip compare result [ip, pattern, matched]: [%s, %s, %d]",
+            "DEBUG: ip compare result [ip, pattern, matched]: [%s, %s, %d]",
             ip, ip_patterns[i], res
         );
 
@@ -513,7 +513,10 @@ int count_usable_interfaces() {
 
 void send_udp_message(const int redis_port) {
     struct ifaddrs *ifaddr;
-    const int max_threads = count_usable_interfaces();
+    const int max_threads = ip_pattern_count > 0 && ip_pattern_count < count_usable_interfaces()
+        ? ip_pattern_count
+        : count_usable_interfaces()
+    ;
 
     if (!max_threads) {
         RedisModule_Log(NULL, "notice", "%s: no network interfaces found", get_service_name());
@@ -546,6 +549,7 @@ void send_udp_message(const int redis_port) {
 
         const struct sockaddr_in *addr_in = (struct sockaddr_in *)ifa->ifa_addr;
         char ip[INET_ADDRSTRLEN];
+
         inet_ntop(AF_INET, &addr_in->sin_addr, ip, sizeof(ip));
 
         // Skip if IP doesn't match any of our patterns
@@ -553,7 +557,7 @@ void send_udp_message(const int redis_port) {
             RedisModule_Log(
                 NULL,
                 "debug",
-                "send_udp_message: %s: skipping interface with IP %s (doesn't match patterns)",
+                "DEBUG: send_udp_message: %s: skipping interface with IP %s (doesn't match patterns)",
                 get_service_name(), ip
             );
 
@@ -562,7 +566,7 @@ void send_udp_message(const int redis_port) {
             RedisModule_Log(
                 NULL,
                 "debug",
-                "send_udp_message: %s: using interface with IP %s (as it matches patterns)",
+                "DEBUG: send_udp_message: %s: using interface with IP %s (as it matches patterns)",
                 get_service_name(), ip
             );
         }
@@ -584,7 +588,7 @@ void send_udp_message(const int redis_port) {
         RedisModule_Log(
             NULL,
             "warning",
-            "%s: no interfaces matched the specified IP patterns",
+            "DEBUG: %s: no interfaces matched the specified IP patterns",
             get_service_name()
         );
     }
