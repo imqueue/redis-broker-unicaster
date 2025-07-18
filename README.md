@@ -30,6 +30,7 @@ Environment variables available:
 - REDIS_BROADCAST_NAME (default is "imq-broker")
 - REDIS_BROADCAST_PORT (default is 63000)
 - REDIS_BROADCAST_INTERVAL (in seconds, default is 1 second)
+- SELECTED_INTERFACES="10,192.168,172.20" (comma-separated IP patters to match when binding to interfaces)
 
 Either configure through redis.conf or by launching the server with `--loadmodule` option, like:
 

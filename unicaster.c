@@ -35,8 +35,9 @@
 #define DEFAULT_NAME "imq-broker"
 #define DEFAULT_PORT 63000
 #define DEFAULT_INTERVAL 1
-#define MAX_REDIS_BINDS 8
+#define MAX_REDIS_BINDS 16
 #define MAX_PODS 10000
+#define MAX_IP_PATTERNS 16
 
 static int enable_logging = 0;
 static int global_redis_port = 6379;
@@ -50,6 +51,58 @@ static int allow_all_interfaces = 0;
 static pthread_t *thread_ids = NULL;
 static int thread_count = 0;
 static pthread_mutex_t thread_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static char *ip_patterns[MAX_IP_PATTERNS];
+static int ip_pattern_count = 0;
+
+void init_ip_patterns() {
+    const char *patterns_env = getenv("SELECTED_INTERFACES");
+
+    if (!patterns_env) {
+        return;
+    }
+
+    char *patterns_str = strdup(patterns_env);
+    char *pattern = strtok(patterns_str, ",");
+
+    while (pattern && ip_pattern_count < MAX_IP_PATTERNS) {
+        // Trim whitespace
+        while (*pattern == ' ') pattern++;
+        char *end = pattern + strlen(pattern) - 1;
+        while (end > pattern && *end == ' ') end--;
+        *(end + 1) = '\0';
+
+        if (strlen(pattern) > 0) {
+            ip_patterns[ip_pattern_count] = strdup(pattern);
+            ip_pattern_count++;
+        }
+        pattern = strtok(NULL, ",");
+    }
+
+    free(patterns_str);
+}
+
+void cleanup_ip_patterns() {
+    for (int i = 0; i < ip_pattern_count; i++) {
+        free(ip_patterns[i]);
+    }
+    ip_pattern_count = 0;
+}
+
+int ip_matches_pattern(const char *ip) {
+    // If no patterns defined, accept all IPs
+    if (ip_pattern_count == 0) {
+        return 1;
+    }
+
+    for (int i = 0; i < ip_pattern_count; i++) {
+        if (strncmp(ip, ip_patterns[i], strlen(ip_patterns[i])) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 
 void generate_redis_guid() {
     uuid_t binuuid;
@@ -456,6 +509,15 @@ void send_udp_message(const int redis_port) {
         char ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &addr_in->sin_addr, ip, sizeof(ip));
 
+        // Skip if IP doesn't match any of our patterns
+        if (!ip_matches_pattern(ip)) {
+            if (enable_logging) {
+                RedisModule_Log(NULL, "notice", "%s: skipping interface with IP %s (doesn't match patterns)",
+                              get_service_name(), ip);
+            }
+            continue;
+        }
+
         BroadcastTask *task = malloc(sizeof(BroadcastTask));
         strncpy(task->source_ip, ip, sizeof(task->source_ip));
         task->redis_port = redis_port;
@@ -467,6 +529,11 @@ void send_udp_message(const int redis_port) {
         } else {
             free(task);
         }
+    }
+
+    if (thread_count == 0 && ip_pattern_count > 0) {
+        RedisModule_Log(NULL, "warning", "%s: no interfaces matched the specified IP patterns",
+                       get_service_name());
     }
 
     freeifaddrs(ifaddr);
@@ -486,6 +553,8 @@ void cleanup_threads() {
     free(thread_ids);
     thread_ids = NULL;
     thread_count = 0;
+
+    cleanup_ip_patterns();
 }
 
 void shutdown_callback(
