@@ -542,6 +542,9 @@ void send_udp_message(const int redis_port) {
         return;
     }
 
+    // Initialize IP patterns
+    init_ip_patterns();
+
     for (const struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
         if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) {
             continue;
