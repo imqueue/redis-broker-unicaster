@@ -59,23 +59,51 @@ void init_ip_patterns() {
     const char *patterns_env = getenv("SELECTED_INTERFACES");
 
     if (!patterns_env) {
+        RedisModule_Log(
+            NULL,
+            "warning",
+            "DEBUG: SELECTED_INTERFACES is not defined"
+        );
+
         return;
     }
+
+    RedisModule_Log(
+        NULL,
+        "debug",
+        "DEBUG: SELECTED_INTERFACES: %s",
+        patterns_env
+    );
 
     char *patterns_str = strdup(patterns_env);
     char *pattern = strtok(patterns_str, ",");
 
     while (pattern && ip_pattern_count < MAX_IP_PATTERNS) {
         // Trim whitespace
-        while (*pattern == ' ') pattern++;
+        while (*pattern == ' ') {
+            pattern++;
+        }
+
         char *end = pattern + strlen(pattern) - 1;
-        while (end > pattern && *end == ' ') end--;
+
+        while (end > pattern && *end == ' ') {
+            end--;
+        }
+
         *(end + 1) = '\0';
+
+        RedisModule_Log(
+            NULL,
+            "debug",
+            "DEBUG: pattern found: %s",
+            pattern
+        );
 
         if (strlen(pattern) > 0) {
             ip_patterns[ip_pattern_count] = strdup(pattern);
             ip_pattern_count++;
         }
+
         pattern = strtok(NULL, ",");
     }
 
@@ -86,6 +114,7 @@ void cleanup_ip_patterns() {
     for (int i = 0; i < ip_pattern_count; i++) {
         free(ip_patterns[i]);
     }
+
     ip_pattern_count = 0;
 }
 
@@ -96,10 +125,20 @@ int ip_matches_pattern(const char *ip) {
     }
 
     for (int i = 0; i < ip_pattern_count; i++) {
-        if (strncmp(ip, ip_patterns[i], strlen(ip_patterns[i])) == 0) {
+        const int res = strncmp(ip, ip_patterns[i], strlen(ip_patterns[i]));
+
+        RedisModule_Log(
+            NULL,
+            "debug",
+            "DEBUG: ip compare result [ip, pattern, matched]: [%s, %s, %d]",
+            ip, ip_patterns[i], res
+        );
+
+        if (res == 0) {
             return 1;
         }
     }
+
     return 0;
 }
 
@@ -479,7 +518,10 @@ int count_usable_interfaces() {
 
 void send_udp_message(const int redis_port) {
     struct ifaddrs *ifaddr;
-    const int max_threads = count_usable_interfaces();
+    const int max_threads = ip_pattern_count > 0 && ip_pattern_count < count_usable_interfaces()
+        ? ip_pattern_count
+        : count_usable_interfaces()
+    ;
 
     if (!max_threads) {
         RedisModule_Log(NULL, "notice", "%s: no network interfaces found", get_service_name());
@@ -505,6 +547,9 @@ void send_udp_message(const int redis_port) {
         return;
     }
 
+    // Initialize IP patterns
+    init_ip_patterns();
+
     for (const struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
         if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) {
             continue;
@@ -512,15 +557,26 @@ void send_udp_message(const int redis_port) {
 
         const struct sockaddr_in *addr_in = (struct sockaddr_in *)ifa->ifa_addr;
         char ip[INET_ADDRSTRLEN];
+
         inet_ntop(AF_INET, &addr_in->sin_addr, ip, sizeof(ip));
 
         // Skip if IP doesn't match any of our patterns
         if (!ip_matches_pattern(ip)) {
-            if (enable_logging) {
-                RedisModule_Log(NULL, "notice", "%s: skipping interface with IP %s (doesn't match patterns)",
-                              get_service_name(), ip);
-            }
+            RedisModule_Log(
+                NULL,
+                "debug",
+                "DEBUG: send_udp_message: %s: skipping interface with IP %s (doesn't match patterns)",
+                get_service_name(), ip
+            );
+
             continue;
+        } else {
+            RedisModule_Log(
+                NULL,
+                "debug",
+                "DEBUG: send_udp_message: %s: using interface with IP %s (as it matches patterns)",
+                get_service_name(), ip
+            );
         }
 
         BroadcastTask *task = malloc(sizeof(BroadcastTask));
@@ -537,8 +593,12 @@ void send_udp_message(const int redis_port) {
     }
 
     if (thread_count == 0 && ip_pattern_count > 0) {
-        RedisModule_Log(NULL, "warning", "%s: no interfaces matched the specified IP patterns",
-                       get_service_name());
+        RedisModule_Log(
+            NULL,
+            "warning",
+            "DEBUG: %s: no interfaces matched the specified IP patterns",
+            get_service_name()
+        );
     }
 
     freeifaddrs(ifaddr);
