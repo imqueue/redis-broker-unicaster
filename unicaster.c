@@ -300,7 +300,12 @@ char **fetch_pod_ips(int *pod_count) {
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, auth_header);
 
-    curl_easy_setopt(curl, CURLOPT_URL, "https://kubernetes.default.svc/api/v1/namespaces/development/pods");
+    const char *deployment_env = getenv("DEPLOYMENT_ENV");
+    char url[256];
+    snprintf(url, sizeof(url), "https://kubernetes.default.svc/api/v1/namespaces/%s/pods",
+             deployment_env ? deployment_env : "");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_CAINFO, "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
