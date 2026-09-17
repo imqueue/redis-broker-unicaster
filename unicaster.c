@@ -781,6 +781,67 @@ void cleanup_threads() {
     cleanup_ip_patterns();
 }
 
+/*
+ * Starts the broadcaster threads.
+ *
+ * Called from the startup cron hook rather than from RedisModule_OnLoad(),
+ * because modules are loaded before the listeners exist: announcing there
+ * advertised an address that still refused connections, and a client that
+ * dialled the address it learned that way was refused.
+ */
+void start_broadcasting(RedisModuleCtx *ctx, void *data) {
+    (void)data;
+
+    // a shutdown that wins the race must not start broadcaster threads
+    if (is_closing) {
+        return;
+    }
+
+    RedisModule_Log(
+        ctx,
+        "notice",
+        "%s: announcing port %d (%s)",
+        get_service_name(),
+        global_redis_port,
+        global_redis_tls ? "tls" : "plain"
+    );
+
+    send_udp_message(global_redis_port, global_redis_tls);
+}
+
+/*
+ * Fires on the first server cron after load, removes itself, then announces.
+ *
+ * Redis enters its event loop only after initListeners() and loadDataFromDisk(),
+ * so the first announcement cannot precede the listener. Unsubscribing first
+ * means the hook cannot run twice and leaves no callback behind once it has
+ * done its one job.
+ */
+void cron_broadcast_once(
+    RedisModuleCtx *ctx,
+    RedisModuleEvent e,
+    uint64_t subevent,
+    void *data
+) {
+    (void)e;
+    (void)subevent;
+    (void)data;
+
+    if (RedisModule_SubscribeToServerEvent(
+            ctx, RedisModuleEvent_CronLoop, NULL) != REDISMODULE_OK) {
+        RedisModule_Log(
+            ctx,
+            "warning",
+            "%s: could not remove the startup cron hook",
+            get_service_name()
+        );
+
+        return;
+    }
+
+    start_broadcasting(ctx, NULL);
+}
+
 void shutdown_callback(
     // ReSharper disable once CppParameterMayBeConstPtrOrRef
     RedisModuleCtx *ctx,
@@ -857,16 +918,7 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx) {
         return REDISMODULE_OK;
     }
 
-    RedisModule_Log(
-        ctx,
-        "notice",
-        "%s: announcing port %d (%s)",
-        get_service_name(),
-        global_redis_port,
-        global_redis_tls ? "tls" : "plain"
-    );
-
-    send_udp_message(global_redis_port, global_redis_tls);
+    RedisModule_SubscribeToServerEvent(ctx, RedisModuleEvent_CronLoop, cron_broadcast_once);
 
     return REDISMODULE_OK;
 }
