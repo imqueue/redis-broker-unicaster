@@ -5,7 +5,8 @@ REDIS_INCLUDE_PATH = .
 
 # Module name and files
 MODULE_NAME = unicaster
-SRC = $(MODULE_NAME).c
+SRC = $(MODULE_NAME).c settings.c closing.c pod_list.c pod_cache.c
+HEADERS = redismodule.h settings.h closing.h pod_list.h pod_cache.h
 SO = $(MODULE_NAME).so
 
 LIBS = -luuid -lcurl -ljson-c
@@ -14,7 +15,7 @@ LIBS = -luuid -lcurl -ljson-c
 all: $(SO)
 
 # Compile the Redis module
-$(SO): $(SRC) redismodule.h
+$(SO): $(SRC) $(HEADERS)
 	$(CC) $(CFLAGS) -shared -o $(SO) $(SRC) -I$(REDIS_INCLUDE_PATH) $(LIBS)
 
 # Clean up build artifacts
