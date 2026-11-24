@@ -67,6 +67,51 @@ imq-broker      2cc7c345-3569-44bb-b57a-b72d729d7012    down    127.0.0.1:6380
 The fields are positional and only ever appended to, so a reader that splits on tabs and takes the first five sees
 exactly what it saw before this field existed.
 
+## Liveness
+
+Services read the announcements as this broker's heartbeat. They keep routing
+calls to a broker for as long as its `up` keeps arriving, and look closer only
+when it stops: once nothing has arrived for the interval plus
+`aliveTimeoutCorrection` (5 seconds by default in `@imqueue/core`) they PING the
+broker, keep it if it answers, and drop it if it does not.
+
+The announcer is a thread of its own, so it can go on talking while Redis
+itself cannot: the main thread deadlocked, or stuck in a command or a script
+that does not return. It used to announce `up` through all of that, so nothing
+lapsed, and services kept sending calls to a broker that answered none of them
+until somebody restarted it.
+
+So `up` now goes out only while Redis is serving. Redis's main thread runs its
+server cron `hz` times a second (10 by default, never less than once) whenever
+it gets back to its event loop, and the module notes the time of each one. When
+none has run for more than **2 × `REDIS_BROADCAST_INTERVAL` + 2 seconds** — 4
+seconds at the default interval — `up` is withheld, from the next interval on,
+until Redis runs its cron again. One warning is logged when announcements stop
+and one notice when they resume.
+
+- **Nothing is sent in its place.** `down` means the broker is going away;
+  silence leaves the decision to the services, which ask the broker directly and
+  keep it if it answers after all.
+- **A slow broker keeps its place.** Where `up` is withheld, the silence a
+  service sees is at least a second shorter than the stall behind it, so a
+  stall shorter than the service's own lapse window (6 seconds by default) never
+  lapses it, whatever its `aliveTimeoutCorrection`. A stall shorter than the
+  limit withholds nothing at all: a large `KEYS`, a slow `SAVE` or a long script
+  that ends within it looks exactly as it did before.
+- **A stuck broker is dropped.** With the defaults, announcements stop 4 to 5
+  seconds into a stall, and services drop the broker 9 to 12 seconds into it:
+  their 6 second window, then a PING that fails at once (a script answers
+  `BUSY`) or after its 2 second timeout. It is announced again from the first
+  interval after the stall ends, and services take it back.
+- A script running past `busy-reply-threshold` counts as a stall: Redis answers
+  every client `BUSY` and runs no cron until the script ends or is killed.
+- `down` on shutdown is unaffected, and goes out whatever the main thread is
+  doing.
+- The check is a timestamp read, with no lock and no connection: it costs the
+  main thread nothing, cannot wait on it, and needs no credentials, so it works
+  the same with `requirepass`, ACLs and TLS-only listeners. While Redis is
+  serving, the announcements and their cadence are exactly what they were.
+
 ## Pod list
 
 Announcing and asking Kubernetes who to announce to are two separate jobs. One

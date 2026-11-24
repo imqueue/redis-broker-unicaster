@@ -34,6 +34,7 @@
 #include "settings.h"
 #include "closing.h"
 #include "pod_cache.h"
+#include "liveness.h"
 
 #define MAX_REDIS_BINDS 16
 #define MAX_IP_PATTERNS 16
@@ -439,6 +440,15 @@ void* unicast_thread(void* arg) {
     // returned; a slow or failing API delays its refresh, never this loop
     while (1) {
         const int closing = is_closing();
+
+        // `down` always goes out; `up` only while redis itself is serving, or
+        // services keep routing calls to a broker that answers none of them
+        if (!closing && !liveness_serving(broadcast_name, broadcast_interval)) {
+            closing_sleep(broadcast_interval);
+
+            continue;
+        }
+
         const char *message = closing ? down_message : up_message;
         const PodSnapshot *snapshot = pod_cache_acquire();
         int failed = 0;
@@ -665,7 +675,8 @@ void start_broadcasting(RedisModuleCtx *ctx) {
 }
 
 /*
- * Fires on every server cron; announces on the first one after load.
+ * Fires on every server cron: records that the main thread is serving, and
+ * announces on the first one after load.
  *
  * Redis enters its event loop only after initListeners() and loadDataFromDisk(),
  * so the first announcement cannot precede the listener.
@@ -674,9 +685,10 @@ void start_broadcasting(RedisModuleCtx *ctx) {
  * inside the callback frees the listener that moduleFireServerEvent() still
  * dereferences after the callback returns (el->module->in_hook--), a
  * use-after-free on every redis from 7.2 to unstable; redis drops the
- * subscription itself on unload. A flag check per cron tick is the cost.
+ * subscription itself on unload. A clock read and a flag check per cron tick
+ * are the cost.
  */
-void cron_broadcast_once(
+void on_server_cron(
     RedisModuleCtx *ctx,
     RedisModuleEvent e,
     uint64_t subevent,
@@ -685,6 +697,9 @@ void cron_broadcast_once(
     (void)e;
     (void)subevent;
     (void)data;
+
+    // first, so the announcers start with a fresh beat to read
+    liveness_beat();
 
     // a shutdown that wins the race must not start broadcaster threads
     if (announced || is_closing()) {
@@ -730,6 +745,7 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx) {
     // a reloaded module must announce again; on musl the DSO is never unloaded,
     // so file-scope state survives MODULE UNLOAD / LOAD unless reset here
     announced = 0;
+    liveness_reset();
     load_redis_bind_ips(ctx);
 
     // done here, while the module has no threads: left to the first
@@ -787,7 +803,7 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx) {
     }
 
     if (RedisModule_SubscribeToServerEvent(
-            ctx, RedisModuleEvent_CronLoop, cron_broadcast_once) != REDISMODULE_OK) {
+            ctx, RedisModuleEvent_CronLoop, on_server_cron) != REDISMODULE_OK) {
         // without the hook nothing ever announces, which is the one failure
         // this module must never keep quiet about
         RedisModule_Log(
